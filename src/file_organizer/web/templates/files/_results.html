@@ -197,6 +197,13 @@
                         <button type="button" data-context-action="rename" disabled title="Rename is not implemented yet">Rename</button>
                         <button type="button" data-context-action="move" disabled title="Move is not implemented yet">Move</button>
                         <button type="button" data-context-action="delete" disabled title="Delete is not implemented yet">Delete</button>
+                        <button
+                            type="button"
+                            data-context-action="reveal"
+                            data-desktop-only
+                            data-open-path="{{ entry.path }}"
+                            onclick="window.desktopOpenPath(this.dataset.openPath)"
+                        >Reveal in Files</button>
                     </div>
                 </div>
             </article>
