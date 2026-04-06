@@ -11,7 +11,32 @@ import time
 from fastapi import APIRouter, Response
 from loguru import logger
 
-router = APIRouter(tags=["health"])
+from file_organizer.api.openapi_responses import (
+    INTERNAL_500_RESPONSE,
+    detail_error_response,
+    merge_responses,
+    success_response,
+)
+
+router = APIRouter(
+    tags=["health"],
+    responses=merge_responses(
+        INTERNAL_500_RESPONSE,
+        success_response(
+            "Backend is running but degraded while dependencies warm up.",
+            {
+                "status": "degraded",
+                "readiness": "starting",
+                "version": "2.0.0-alpha.3",
+                "provider": "ollama",
+                "ollama": False,
+                "uptime": 2.14,
+            },
+            status_code=207,
+        ),
+        detail_error_response(503, detail="Health check returned an unhealthy status."),
+    ),
+)
 
 # Startup time used to compute uptime in health responses.
 # Use monotonic time to avoid issues with system clock adjustments (NTP sync).
