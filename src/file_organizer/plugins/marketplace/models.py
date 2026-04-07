@@ -21,6 +21,7 @@ def utc_now_iso() -> str:
 
 
 def _parse_str_list(raw: object, *, field_name: str) -> tuple[str, ...]:
+    """Return trimmed non-empty strings from `raw`, or raise `MarketplaceSchemaError` when it is not a list."""
     if raw is None:
         return ()
     if not isinstance(raw, list):

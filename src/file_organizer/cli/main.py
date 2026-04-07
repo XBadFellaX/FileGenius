@@ -33,6 +33,8 @@ console = Console()
 
 
 class _CliGlobals(Protocol):
+    """Shared CLI flags exposed across subcommands via `verbose`, `dry_run`, `json_output`, `yes`, and `no_interactive`."""
+
     verbose: bool
     dry_run: bool
     json_output: bool
