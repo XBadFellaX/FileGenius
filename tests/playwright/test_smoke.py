@@ -27,6 +27,8 @@ To watch the tests execute in a visible window add ``--headed``::
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 try:
@@ -95,14 +97,25 @@ class TestPageLoads:
         assert headings.count() > 0, "Setup page has no heading elements"
         assert page.title() != "", "Setup page rendered with empty <title>"
 
-    def test_home_redirect(self, page: Page) -> None:
-        """Root path redirects to ``/ui/setup`` on a fresh server.
+    def test_home_redirect(self, page: Page, playwright_config_dir: Path) -> None:
+        """``/ui/`` redirects to ``/ui/setup`` on a fresh server.
 
-        On a fresh server ``setup_completed`` defaults to ``False``, so the
-        home route always redirects to ``/ui/setup``.  Playwright follows the
-        redirect and lands on a 2xx page.
+        The web router is mounted at ``/ui`` in ``api/main.py`` (the bare ``/``
+        route returns JSON metadata, not a redirect). On a fresh server
+        ``setup_completed`` defaults to ``False``, so ``/ui/`` redirects to
+        ``/ui/setup``. Playwright follows the redirect and lands on a 2xx page.
+
+        Resets ``setup_completed`` immediately before the navigation by
+        deleting any ``config.yaml`` left behind by sibling tests
+        (``test_setup_wizard_flow`` flips it to True). ``ConfigManager.load()``
+        returns ``AppConfig`` defaults when the file is absent, restoring
+        ``setup_completed=False`` regardless of test ordering.
         """
-        response = page.goto("/")
+        config_file = playwright_config_dir / "file-organizer" / "config.yaml"
+        if config_file.exists():
+            config_file.unlink()
+
+        response = page.goto("/ui/")
         assert response is not None
         # After following redirects Playwright lands on a 2xx page.
         assert response.ok, f"Expected 2xx after redirect, got {response.status}"
