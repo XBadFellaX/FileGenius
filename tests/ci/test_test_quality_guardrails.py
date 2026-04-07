@@ -278,23 +278,27 @@ def test_changed_tests_have_no_vacuous_len_lte_assertions() -> None:
 # Fix 5b: vacuous >= 0 assertions (always-true lower bounds)
 # -------------------------------------------------------------------------
 
-_GTE_ZERO_NON_NEGATIVE_ATTRS = frozenset({"count", "duration", "total_size", "size", "length"})
+_GTE_ZERO_NON_NEGATIVE_ATTRS = frozenset(
+    {"count", "duration", "total_size", "size", "length", "score", "bytes", "elapsed", "total"}
+)
 
 
 def _find_vacuous_len_gte_zero_assertions(source: str, path: str = "<string>") -> list[str]:
-    """Return assertions that are always true because the left side is non-negative by definition.
+    """
+    Finds assert statements that are tautologically true because the compared expression is always >= 0.
 
-    Detects two forms:
+    Detects two forms and their reversed comparisons:
+    1. len(...) compared to 0: `assert len(x) >= 0` or `assert 0 <= len(x)`
+    2. Known non-negative attributes compared to 0: `assert x.count >= 0` or `assert 0 <= x.count`
+    These matches use the module's blocklist of known-non-negative attribute names
+    (``_GTE_ZERO_NON_NEGATIVE_ATTRS``).
 
-    1. ``assert len(x) >= 0``  (forward) and ``assert 0 <= len(x)``  (reverse)
-       ``len()`` always returns a non-negative integer, so ``>= 0`` is tautological.
+    Parameters:
+        source (str): Python source code to analyze.
+        path (str): Optional filename used in reported violation strings.
 
-    2. ``assert x.attr >= 0``  (forward) and ``assert 0 <= x.attr``  (reverse)
-       where ``attr`` is one of the known non-negative attribute names
-       (``count``, ``duration``, ``total_size``, ``size``, ``length``).
-
-    These pass even when the code under test is completely broken.  Use a
-    meaningful bound (``>= 1``, ``== N``, ``< max_val``) instead.
+    Returns:
+        list[str]: A list of violation strings formatted as "{path}:{lineno}".
     """
     try:
         tree = ast.parse(source, filename=path)
@@ -350,6 +354,10 @@ def _find_vacuous_len_gte_zero_assertions(source: str, path: str = "<string>") -
         ("assert x.total_size >= 0\n", 1),
         ("assert x.size >= 0\n", 1),
         ("assert x.length >= 0\n", 1),
+        ("assert x.score >= 0\n", 1),
+        ("assert x.bytes >= 0\n", 1),
+        ("assert x.elapsed >= 0\n", 1),
+        ("assert x.total >= 0\n", 1),
         ("assert 0 <= x.count\n", 1),
         # Meaningful bounds — should NOT flag
         ("assert len(results) >= 1\n", 0),
@@ -380,6 +388,153 @@ def test_changed_tests_have_no_vacuous_len_gte_zero_assertions() -> None:
 
     assert not violations, (
         "Vacuous ``>= 0`` assertion found — use a meaningful bound instead:\n"
+        + "\n".join(violations)
+    )
+
+
+# -------------------------------------------------------------------------
+# Fix 5c: bare-name >= 0 assertions (e.g. assert count >= 0)
+# -------------------------------------------------------------------------
+
+_GTE_ZERO_BARE_NAME_VARS = frozenset(
+    {
+        "count",
+        "size",
+        "total_size",
+        "score",
+        "bytes",
+        "duration",
+        "elapsed",
+        "length",
+        "num_files",
+        "num_items",
+    }
+)
+
+
+def _find_vacuous_bare_name_gte_zero_assertions(source: str, path: str = "<string>") -> list[str]:
+    """
+    Detect assertions that tautologically compare certain bare variable names to zero.
+
+    Flags occurrences of "assert VAR >= 0" and "assert 0 <= VAR" where VAR is a bare name present in _GTE_ZERO_BARE_NAME_VARS; each finding is reported as "path:lineno".
+
+    Parameters:
+        source (str): Python source code to analyze.
+        path (str): File path used in reported violation strings (defaults to "<string>").
+
+    Returns:
+        list[str]: Violation strings in the form "path:lineno" for each detected tautological assertion.
+    """
+    try:
+        tree = ast.parse(source, filename=path)
+    except SyntaxError:
+        return []
+
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assert):
+            continue
+        test = node.test
+        if not isinstance(test, ast.Compare):
+            continue
+        if len(test.ops) != 1 or len(test.comparators) != 1:
+            continue
+
+        left = test.left
+        op = test.ops[0]
+        right = test.comparators[0]
+
+        def _is_zero(n: ast.AST) -> bool:
+            """
+            Check whether an AST node represents the integer constant 0.
+
+            Parameters:
+                n (ast.AST): The AST node to inspect.
+
+            Returns:
+                `True` if `n` is an `ast.Constant` whose value is the integer 0, `False` otherwise.
+            """
+            return isinstance(n, ast.Constant) and n.value == 0
+
+        def _is_bare_name_var(n: ast.AST) -> bool:
+            """
+            Check whether an AST node is a bare name listed as a non-negative semantic variable.
+
+            Parameters:
+                n (ast.AST): The AST node to inspect.
+
+            Returns:
+                bool: `True` if `n` is an `ast.Name` whose identifier is a member of `_GTE_ZERO_BARE_NAME_VARS`, `False` otherwise.
+            """
+            return isinstance(n, ast.Name) and n.id in _GTE_ZERO_BARE_NAME_VARS
+
+        # assert count >= 0  (forward)
+        forward = _is_bare_name_var(left) and isinstance(op, ast.GtE) and _is_zero(right)
+        # assert 0 <= count  (reverse)
+        reverse = _is_zero(left) and isinstance(op, ast.LtE) and _is_bare_name_var(right)
+
+        if forward or reverse:
+            violations.append(f"{path}:{node.lineno}")
+
+    return violations
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_count"),
+    [
+        # bare name >= 0 — always true, should flag
+        ("assert count >= 0\n", 1),
+        ("assert size >= 0\n", 1),
+        ("assert total_size >= 0\n", 1),
+        ("assert score >= 0\n", 1),
+        ("assert bytes >= 0\n", 1),
+        ("assert duration >= 0\n", 1),
+        ("assert elapsed >= 0\n", 1),
+        ("assert length >= 0\n", 1),
+        ("assert num_files >= 0\n", 1),
+        ("assert num_items >= 0\n", 1),
+        ("assert 0 <= count\n", 1),
+        # Meaningful bounds — should NOT flag
+        ("assert count >= 1\n", 0),
+        ("assert count > 0\n", 0),
+        ("assert count == 0\n", 0),
+        ("assert duration < 5.0\n", 0),
+        # Generic variable names — should NOT flag (not in the semantic set)
+        ("assert value >= 0\n", 0),
+        ("assert result >= 0\n", 0),
+    ],
+)
+def test_detector_flags_vacuous_bare_name_gte_zero(source: str, expected_count: int) -> None:
+    """
+    Asserts that the bare-name `>= 0` detector finds the expected number of violations in a Python source snippet.
+
+    Parameters:
+        source (str): Python source code to analyze.
+        expected_count (int): Number of violations the detector is expected to return.
+    """
+    assert len(_find_vacuous_bare_name_gte_zero_assertions(source)) == expected_count
+
+
+def test_changed_tests_have_no_vacuous_bare_name_gte_zero_assertions() -> None:
+    """Test files must not use ``assert count >= 0`` or similar bare-name tautologies.
+
+    Variables like ``count``, ``size``, ``score``, ``bytes``, ``duration``, and
+    ``elapsed`` are semantically non-negative by definition.  Asserting ``>= 0``
+    provides zero signal — it passes even when the code under test is broken.
+
+    Use a meaningful bound (``>= 1``, ``> 0``), exact value (``== N``), or an
+    upper bound (``< max_val``) instead.
+
+    This guardrail is diff-scoped (checks only files changed relative to ``main``)
+    because pre-existing violations in the full test suite have not yet been cleaned up.
+    """
+    violations: list[str] = []
+    for path in _git_changed_test_files():
+        source = path.read_text(encoding="utf-8")
+        violations.extend(_find_vacuous_bare_name_gte_zero_assertions(source, str(path)))
+
+    assert not violations, (
+        "Vacuous bare-name ``>= 0`` assertion found — use a meaningful bound instead:\n"
         + "\n".join(violations)
     )
 
