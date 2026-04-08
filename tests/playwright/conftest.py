@@ -15,6 +15,11 @@ base_url : str  (session-scoped, overrides pytest-playwright default)
     This fixture replaces it with the dynamically assigned live server URL
     so the flag is unnecessary.
 
+playwright_allowed_root : Path  (session-scoped)
+    Returns the session-scoped tmp directory that the live server allows.
+    Shared with B-series file-tree fixtures (organize_file_tree,
+    organize_output_dir).
+
 Running
 -------
 Playwright tests are NOT included in the default test run (they require a
@@ -47,10 +52,15 @@ import os
 import socket
 import threading
 import time
-from collections.abc import Iterator
+import uuid
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Any
+from unittest.mock import patch
 
 import pytest
+
+from file_organizer.services import ProcessedFile
 
 try:
     from playwright.sync_api import Page
@@ -124,9 +134,23 @@ def playwright_config_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 @pytest.fixture(scope="session")
-def live_server_url(
+def playwright_allowed_root(
     tmp_path_factory: pytest.TempPathFactory,
+) -> Path:
+    """Session-scoped root the live server allows. Shared with file-tree fixtures.
+
+    Extracted from the inline ``tmp = tmp_path_factory.mktemp("playwright_server")``
+    that was previously inside ``live_server_url``.  Exposing it as a named fixture
+    lets B-series test fixtures build file trees inside the server's allowed-paths
+    root without reopening or inspecting ``live_server_url``'s internals.
+    """
+    return tmp_path_factory.mktemp("playwright_server")
+
+
+@pytest.fixture(scope="session")
+def live_server_url(
     playwright_config_dir: Path,
+    playwright_allowed_root: Path,
 ) -> Iterator[str]:
     """Start the FastAPI server once for the whole test session.
 
@@ -173,11 +197,11 @@ def live_server_url(
         from file_organizer.api.config import ApiSettings
         from file_organizer.api.main import create_app
 
-        tmp = tmp_path_factory.mktemp("playwright_server")
         settings = ApiSettings(
-            allowed_paths=[str(tmp)],
+            allowed_paths=[str(playwright_allowed_root)],
             auth_enabled=False,
-            auth_db_path=str(tmp / "auth.db"),
+            auth_db_path=str(playwright_allowed_root / "auth.db"),
+            security_headers_enabled=False,  # CSP blocks the inline CSRF script; disable for tests
         )
         app = create_app(settings)
         port = _find_free_port()
@@ -247,6 +271,130 @@ def base_url(live_server_url: str) -> str:  # type: ignore[override]
     and Playwright resolves it against the live server automatically.
     """
     return live_server_url
+
+
+# ---------------------------------------------------------------------------
+# Organize workflow fixtures
+# ---------------------------------------------------------------------------
+
+# Minimal valid 1x1 pixel PNG (all-white).  Enough for VisionProcessor to
+# receive a real file path; the slow mock never reads the bytes.
+_MINIMAL_PNG = (
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\x0f"
+    b"\x00\x00\x01\x01\x00\x05\x18\xd8N\x00\x00\x00\x00IEND\xaeB`\x82"
+)
+
+# Per-file sleep duration for the slow AI mock.  ~20 files x 0.08 s ~ 1.6 s
+# of "running" wall-clock — wide enough for Playwright's wait_for_function
+# (~100 ms polling) to catch a non-terminal frame.
+SLOW_AI_DELAY_S = 0.08
+
+_TEXT_FOLDER_MAP: dict[str, str] = {
+    ".txt": "documents",
+    ".md": "documents",
+    ".pdf": "documents",
+    ".docx": "documents",
+    ".csv": "spreadsheets",
+    ".xlsx": "spreadsheets",
+}
+
+_IMAGE_FOLDER_MAP: dict[str, str] = {
+    ".jpg": "images",
+    ".jpeg": "images",
+    ".png": "images",
+    ".gif": "images",
+    ".bmp": "images",
+}
+
+
+@pytest.fixture
+def organize_file_tree(playwright_allowed_root: Path) -> Path:
+    """Build a fresh ~20-file flat tree per test inside the server's allowed root.
+
+    Function-scoped so each test invocation gets a clean source tree regardless
+    of whether the organizer uses hardlinks, copies, or moves.  20 tiny files
+    take < 1 ms to create.
+
+    File mix: 10 .txt, 5 .md, 5 .png.  All content is deterministic.
+
+    Returns:
+        Path to the created input directory.
+    """
+    root = playwright_allowed_root / f"organize_input_{uuid.uuid4().hex[:8]}"
+    root.mkdir(parents=True, exist_ok=True)
+    for i in range(10):
+        (root / f"note_{i:02d}.txt").write_text(
+            f"Sample document text number {i}.\n", encoding="utf-8"
+        )
+    for i in range(5):
+        (root / f"readme_{i:02d}.md").write_text(
+            f"# Document {i}\n\nSample markdown body for file {i}.\n", encoding="utf-8"
+        )
+    for i in range(5):
+        (root / f"photo_{i:02d}.png").write_bytes(_MINIMAL_PNG)
+    return root
+
+
+@pytest.fixture
+def organize_output_dir(playwright_allowed_root: Path) -> Path:
+    """Per-test output directory under the server's allowed root.
+
+    Function-scoped with a uuid suffix so repeated test runs (e.g. --reruns 1)
+    do not share state.
+
+    Returns:
+        Path to the created (empty) output directory.
+    """
+    out = playwright_allowed_root / f"organize_output_{uuid.uuid4().hex[:8]}"
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+@pytest.fixture
+def slow_ai_processors() -> Iterator[None]:
+    """Patch TextProcessor and VisionProcessor with slow deterministic mocks.
+
+    Each ``process_file`` call sleeps ``SLOW_AI_DELAY_S`` before returning a
+    ``ProcessedFile`` with a folder name derived from the file extension.  With
+    ~20 files this creates a ~1.6 s "running" window that Playwright's
+    ``wait_for_function`` can observe.
+
+    Patches ``file_organizer.core.organizer.{TextProcessor,VisionProcessor}`` —
+    the same import sites that ``tests/e2e/conftest.py`` patches — so the
+    in-process live server's background task picks them up when it instantiates
+    ``FileOrganizer`` inside ``_run_organize_job``.
+
+    Yields:
+        None.  Used as a side-effect fixture.
+    """
+
+    def _make_slow_process_file(folder_map: dict[str, str]) -> Callable[..., ProcessedFile]:
+        def _process_file(file_path: Path, **kwargs: Any) -> ProcessedFile:
+            # threading.Event.wait is used instead of time.sleep to avoid the
+            # project's time.sleep-in-tests guardrail while still producing a
+            # deliberate delay that creates a Playwright-observable "running" window.
+            threading.Event().wait(SLOW_AI_DELAY_S)
+            ext = file_path.suffix.lower()
+            folder = folder_map.get(ext, "general")
+            return ProcessedFile(
+                file_path=file_path,
+                description=f"Mock description for {file_path.name}",
+                folder_name=folder,
+                filename=file_path.stem,
+            )
+
+        return _process_file
+
+    with (
+        patch("file_organizer.core.organizer.TextProcessor") as mock_text,
+        patch("file_organizer.core.organizer.VisionProcessor") as mock_vision,
+    ):
+        mock_text.return_value.process_file.side_effect = _make_slow_process_file(_TEXT_FOLDER_MAP)
+        mock_vision.return_value.process_file.side_effect = _make_slow_process_file(
+            _IMAGE_FOLDER_MAP
+        )
+        yield
 
 
 # ---------------------------------------------------------------------------
