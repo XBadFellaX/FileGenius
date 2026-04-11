@@ -139,6 +139,16 @@ repos:
         pass_filenames: false
 
       # ----------------------------------------------------------------
+      # Type checking on models (scoped mypy gate)
+      # ----------------------------------------------------------------
+      - id: mypy-changed
+        name: mypy (changed models files)
+        entry: bash scripts/run-mypy-changed.sh
+        language: system
+        files: ^src/file_organizer/models/.*\.py$
+        pass_filenames: true
+
+      # ----------------------------------------------------------------
       # PyPI version validation
       # ----------------------------------------------------------------
       - id: pypi-version-check
@@ -183,6 +193,18 @@ repos:
         language: system
         files: ^(src/file_organizer/review_regressions/|tests/unit/review_regressions/test_)
         pass_filenames: true
+
+      # ----------------------------------------------------------------
+      # CSRF regression guard: run csrf tests when csrf.py or its test changes.
+      # Prevents behavioral regressions in replay-protection, middleware
+      # edge cases, and token validation paths.
+      # ----------------------------------------------------------------
+      - id: pytest-csrf-guardrails
+        name: pytest (csrf guardrails)
+        entry: bash -c "pytest tests/web/test_csrf.py -q --override-ini='addopts='"
+        language: system
+        files: ^(src/file_organizer/web/csrf\.py|tests/web/test_csrf\.py)$
+        pass_filenames: false
 
       # ----------------------------------------------------------------
       # Unused dependency detection
